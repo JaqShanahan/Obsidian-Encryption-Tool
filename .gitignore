@@ -1,0 +1,21 @@
+# Runtime config and secrets -- never commit these
+config.json
+*.pem
+xor_key.bin
+mlkem_*.bin
+.vault_manifest
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller working directory (dist/ is committed on purpose: release build)
+build/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
