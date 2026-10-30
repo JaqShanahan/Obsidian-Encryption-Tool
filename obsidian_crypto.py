@@ -41,10 +41,20 @@ def progress_bar(current: int, total: int, width: int = 35):
 def get_config_path():
     return os.path.join(script_dir, 'config.json')
 
+def get_xor_key_path():
+    config = load_config()
+    path = config.get('xor_key', '').strip()
+    if path:
+        if os.path.isdir(path):
+            return os.path.join(path, 'xor_key.bin')
+        return path
+    return os.path.join(script_dir, 'xor_key.bin')
+
 DEFAULT_CONFIG = {
     'brain_folder': '',
     'private_key': '',
     'public_key': '',
+    'xor_key': '',
 }
 
 def load_config():
@@ -113,6 +123,48 @@ def get_manifest_mode(path):
         return 'rsa-4096'
     return None
 
+def load_xor_key():
+    path = get_xor_key_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except Exception as e:
+        print(c(f"\n  Error reading XOR key: {e}", RED))
+        return None
+
+def save_xor_key(key):
+    path = get_xor_key_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(key)
+
+def xor_encrypt_name(rel_path: str) -> str:
+    key = load_xor_key()
+    if key is None:
+        raise RuntimeError("XOR key not found. Generate one in Config > XOR Key.")
+    parts = rel_path.split(os.sep)
+    enc_parts = []
+    for part in parts:
+        data = part.encode('utf-8')
+        raw = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+        enc_parts.append(base64.urlsafe_b64encode(raw).decode('ascii').rstrip('='))
+    return '/'.join(enc_parts)
+
+def xor_decrypt_name(enc_path: str) -> str:
+    key = load_xor_key()
+    if key is None:
+        raise RuntimeError("XOR key not found. Generate one in Config > XOR Key.")
+    parts = enc_path.split('/')
+    dec_parts = []
+    for part in parts:
+        padded = part + '=' * (-len(part) % 4)
+        data = base64.urlsafe_b64decode(padded)
+        raw = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+        dec_parts.append(raw.decode('utf-8'))
+    return os.sep.join(dec_parts)
+
 # ── HYBRID ENCRYPTION (AES-256-GCM + RSA-4096) ──
 
 AES_KEY_LEN = 32
@@ -148,6 +200,7 @@ def show_menu():
     config = load_config()
     bf = config.get('brain_folder', '') or '(not set)'
     kf = config.get('private_key', '') or '(not set)'
+    xor_ok = os.path.exists(get_xor_key_path())
 
     print(f"\n{BOLD}+{'='*48}+{RESET}")
     print(c("       OBSIDIAN VAULT CRYPTO TOOL", BOLD + CYAN))
@@ -160,6 +213,7 @@ def show_menu():
     print(f"{BOLD}+{'-'*48}+{RESET}")
     print(f"   {c('Brain folder:', CYAN)} {shorten_path(bf)}")
     print(f"   {c('Keys folder:', CYAN)} {shorten_path(os.path.dirname(kf) if kf and kf != '(not set)' else '(not set)')}")
+    print(f"   {c('XOR key:', CYAN)}      {shorten_path(get_xor_key_path())} {c('[OK]', GREEN) if xor_ok else c('[MISSING]', RED)}")
     print(f"   {c('Encryption:', CYAN)}    RSA-4096 + AES-256-GCM")
     print(f"{BOLD}+{'-'*48}+{RESET}\n")
 
@@ -170,26 +224,37 @@ def show_config():
     print(f"{BOLD}+{'='*48}+{RESET}\n")
     config = load_config()
 
+    xor_path = get_xor_key_path()
+    xor_ok = os.path.exists(xor_path)
+    xor_size = os.path.getsize(xor_path) if xor_ok else 0
+
     print(c("  Current Settings:\n", YELLOW))
     print(f"  {c('Brain folder:', CYAN)}     {config.get('brain_folder') or '(not set)'}")
+    print(f"  {c('XOR key:', CYAN)}          {xor_path} ({xor_size} bytes)")
     print(f"  {c('Encryption:', CYAN)}       RSA-4096 + AES-256-GCM")
     print(f"\n{BOLD}+{'-'*48}+{RESET}\n")
     print(c("  What would you like to configure?\n", YELLOW))
     print(f"  {c('[1]', CYAN)} Set Brain folder path")
     print(f"  {c('[2]', CYAN)} Set Keys folder path")
-    print(f"  {c('[3]', CYAN)} Generate new RSA-4096 keys")
-    print(f"  {c('[4]', CYAN)} Reset to defaults")
-    print(f"  {c('[5]', CYAN)} Back to main menu\n")
-    choice = input(f"  {c('Enter choice', YELLOW)} ({c('1-5', CYAN)}): ").strip()
+    print(f"  {c('[3]', CYAN)} Set XOR key path")
+    print(f"  {c('[4]', CYAN)} Generate new RSA-4096 keys")
+    print(f"  {c('[5]', CYAN)} Generate new XOR key (for filenames)")
+    print(f"  {c('[6]', CYAN)} Reset to defaults")
+    print(f"  {c('[7]', CYAN)} Back to main menu\n")
+    choice = input(f"  {c('Enter choice', YELLOW)} ({c('1-7', CYAN)}): ").strip()
     if choice == '1':
         set_brain_folder(config)
     elif choice == '2':
         set_keys_folder(config)
     elif choice == '3':
-        generate_rsa_keys()
+        set_xor_key_path(config)
     elif choice == '4':
-        reset_config()
+        generate_rsa_keys()
     elif choice == '5':
+        generate_xor_key()
+    elif choice == '6':
+        reset_config()
+    elif choice == '7':
         return
     else:
         print(c("\n  Invalid choice.", RED))
@@ -251,6 +316,54 @@ def set_keys_folder(config):
             generate_rsa_keys()
             return
     input("\n  Press Enter to return to config...")
+
+def set_xor_key_path(config):
+    clear()
+    print(f"\n{BOLD}+{'='*48}+{RESET}")
+    print(c("         SET XOR KEY PATH", BOLD + CYAN))
+    print(f"{BOLD}+{'='*48}+{RESET}\n")
+    cur = get_xor_key_path()
+    print(f"  Current: {cur}\n")
+    print(c("  Enter the full path to xor_key.bin\n", YELLOW))
+    print(f"  Leave blank to use the default (app folder)\n")
+    path = input("  Path: ").strip()
+    if path:
+        full = os.path.abspath(path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        config['xor_key'] = full
+    else:
+        config['xor_key'] = ''
+    save_config(config)
+    new_path = get_xor_key_path()
+    if os.path.exists(new_path):
+        print(c("\n  XOR key found at this path!", GREEN))
+    else:
+        print(c("\n  Path set. No key file exists there yet.", YELLOW))
+        gen = input("  Generate a new XOR key now? (Y/n): ").strip().lower()
+        if gen != 'n':
+            generate_xor_key()
+            return
+    input("\n  Press Enter to return to config...")
+
+def generate_xor_key():
+    clear()
+    print(f"\n{BOLD}+{'='*48}+{RESET}")
+    print(c("         XOR KEY GENERATION", BOLD + CYAN))
+    print(f"{BOLD}+{'='*48}+{RESET}\n")
+    xor_path = get_xor_key_path()
+    if os.path.exists(xor_path):
+        print(c("  XOR key already exists!\n", YELLOW))
+        print(f"  Path: {xor_path}\n")
+        if input("  Overwrite? (y/N): ").strip().lower() != 'y':
+            print(c("\n  Cancelled.\n", YELLOW))
+            input("  Press Enter to return...")
+            return
+    print(c("  Generating 32-byte XOR key...\n", YELLOW))
+    key = secrets.token_bytes(32)
+    save_xor_key(key)
+    print(c("  XOR key generated and saved!", GREEN))
+    print(f"  Path: {xor_path} ({len(key)} bytes)\n")
+    input("  Press Enter to return...")
 
 def generate_rsa_keys():
     config = load_config()
@@ -324,6 +437,12 @@ def run_encrypt(interactive=True):
         if interactive:
             input("  Press Enter to return to menu...")
         return False
+    if not os.path.exists(get_xor_key_path()):
+        print(c("  XOR key not found!", RED))
+        print(c("  Go to Config > Generate new XOR key first.\n", YELLOW))
+        if interactive:
+            input("  Press Enter to return to menu...")
+        return False
 
     manifest_path = os.path.join(brain_folder, MANIFEST_FILE)
 
@@ -363,14 +482,23 @@ def run_encrypt(interactive=True):
             pass
 
         try:
+            parent_rel = os.path.dirname(rel).replace(os.sep, '/')
+            enc_name = xor_encrypt_name(os.path.basename(rel))
+            safe_name = f"{parent_rel}/{enc_name}" if parent_rel else enc_name
+            safe_filename = enc_name
+
             with open(full, 'rb') as f:
                 content = f.read()
             enc_data = hybrid_encrypt(content, public_key)
 
-            with open(full, 'wb') as f:
+            parent_dir = os.path.dirname(full)
+            new_full = os.path.join(parent_dir, safe_filename)
+            with open(new_full, 'wb') as f:
                 f.write(MAGIC_HEADER + base64.b64encode(enc_data))
 
-            manifest_files[rel] = rel
+            os.remove(full)
+
+            manifest_files[safe_name] = rel
             encrypted_count += 1
         except Exception as e:
             print(c(f"\n  Error encrypting {rel}: {e}", RED))
@@ -384,7 +512,7 @@ def run_encrypt(interactive=True):
 
     print()
     print(c("  +---------------------------------------------+", CYAN))
-    print(f"  {c('[OK]', GREEN)} {c('Encrypted:', BOLD)} {encrypted_count}")
+    print(f"  {c('[OK]', GREEN)} {c('Encrypted:', BOLD)} {encrypted_count}  {c('Files with XOR-encrypted names', BOLD)}")
     print(c("  +---------------------------------------------+", CYAN))
     print()
     if interactive:
