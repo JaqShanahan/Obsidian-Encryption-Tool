@@ -8,8 +8,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from kyber_py.ml_kem import ML_KEM_768
 
 MAGIC_HEADER = b'VAULTRSA_v1\n'
+MLKEM_MAGIC = b'VAULTMLKEM768_v1\n'
+MLKEM_PRIV_MAGIC = b'MLKEM768_PRIV_v1\n'
+MLKEM_PRIV_ENC_MAGIC = b'MLKEM768_PRIV_ENC_v1\n'
 MANIFEST_FILE = '.vault_manifest'
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp'}
 
@@ -55,6 +60,8 @@ DEFAULT_CONFIG = {
     'private_key': '',
     'public_key': '',
     'xor_key': '',
+    'mlkem_private_key': '',
+    'mlkem_public_key': '',
 }
 
 def load_config():
@@ -92,6 +99,19 @@ def get_key_paths():
         return priv, pub
     return os.path.join(script_dir, 'private_key.pem'), os.path.join(script_dir, 'public_key.pem')
 
+def get_mlkem_key_paths():
+    config = load_config()
+    priv = config.get('mlkem_private_key', '').strip()
+    pub = config.get('mlkem_public_key', '').strip()
+    if priv and pub:
+        return priv, pub
+    rsa_priv = config.get('private_key', '').strip()
+    folder = os.path.dirname(rsa_priv) if rsa_priv else script_dir
+    return os.path.join(folder, 'mlkem_private_key.bin'), os.path.join(folder, 'mlkem_public_key.bin')
+
+PQC_LABEL = 'ML-KEM-768'
+PQC_BADGE = c('(POST-QUANTUM SAFE)', BOLD + GREEN)
+
 def get_rel_paths(root_folder):
     paths = []
     for root, dirs, files in os.walk(root_folder):
@@ -109,7 +129,7 @@ def is_content_encrypted(file_path):
     try:
         with open(file_path, 'rb') as f:
             head = f.read(32)
-        return head.startswith(MAGIC_HEADER)
+        return head.startswith(MAGIC_HEADER) or head.startswith(MLKEM_MAGIC)
     except:
         return False
 
@@ -119,6 +139,8 @@ def get_manifest_mode(path):
             head = f.read(32)
     except Exception:
         return None
+    if head.startswith(MLKEM_MAGIC):
+        return 'ml-kem-768'
     if head.startswith(MAGIC_HEADER):
         return 'rsa-4096'
     return None
@@ -165,11 +187,13 @@ def xor_decrypt_name(enc_path: str) -> str:
         dec_parts.append(raw.decode('utf-8'))
     return os.sep.join(dec_parts)
 
-# ── HYBRID ENCRYPTION (AES-256-GCM + RSA-4096) ──
+# ── HYBRID ENCRYPTION (AES-256-GCM + ML-KEM-768, POST-QUANTUM) ──
 
 AES_KEY_LEN = 32
 NONCE_LEN = 12
 TAG_LEN = 16
+
+# ── LEGACY (RSA-4096 + AES-256-GCM) — only used to decrypt old vaults ──
 
 def hybrid_encrypt(plaintext: bytes, pub_key) -> bytes:
     aes_key = secrets.token_bytes(AES_KEY_LEN)
@@ -193,6 +217,62 @@ def hybrid_decrypt(data: bytes, priv_key) -> bytes:
     decryptor = cipher.decryptor()
     return decryptor.update(ciphertext) + decryptor.finalize()
 
+# ── ML-KEM-768 HYBRID ENCRYPTION ──
+
+def mlkem_hybrid_encrypt(plaintext: bytes, ek: bytes) -> bytes:
+    shared, kem_ct = ML_KEM_768.encaps(ek)
+    nonce = secrets.token_bytes(NONCE_LEN)
+    cipher = Cipher(algorithms.AES(shared), modes.GCM(nonce), backend=default_backend())
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+    tag = encryptor.tag
+    return len(kem_ct).to_bytes(2, 'big') + kem_ct + nonce + tag + ciphertext
+
+def mlkem_hybrid_decrypt(data: bytes, dk: bytes) -> bytes:
+    kem_ct_len = int.from_bytes(data[:2], 'big')
+    kem_ct = data[2:2+kem_ct_len]
+    shared = ML_KEM_768.decaps(dk, kem_ct)
+    nonce = data[2+kem_ct_len:2+kem_ct_len+NONCE_LEN]
+    tag = data[2+kem_ct_len+NONCE_LEN:2+kem_ct_len+NONCE_LEN+TAG_LEN]
+    ciphertext = data[2+kem_ct_len+NONCE_LEN+TAG_LEN:]
+    cipher = Cipher(algorithms.AES(shared), modes.GCM(nonce, tag), backend=default_backend())
+    decryptor = cipher.decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
+
+def save_mlkem_private_key(dk: bytes, path: str, password: str = ''):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if password:
+        salt = secrets.token_bytes(16)
+        nonce = secrets.token_bytes(NONCE_LEN)
+        kdf = Scrypt(salt=salt, length=AES_KEY_LEN, n=2**14, r=8, p=1)
+        key = kdf.derive(password.encode('utf-8'))
+        cipher = Cipher(algorithms.AES(key), modes.GCM(nonce), backend=default_backend())
+        encryptor = cipher.encryptor()
+        wrapped = encryptor.update(dk) + encryptor.finalize()
+        payload = MLKEM_PRIV_ENC_MAGIC + salt + nonce + encryptor.tag + wrapped
+    else:
+        payload = MLKEM_PRIV_MAGIC + dk
+    with open(path, 'wb') as f:
+        f.write(payload)
+
+def read_mlkem_private_key(path: str, password: str = '') -> bytes:
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data.startswith(MLKEM_PRIV_ENC_MAGIC):
+        body = data[len(MLKEM_PRIV_ENC_MAGIC):]
+        salt = body[:16]
+        nonce = body[16:16+NONCE_LEN]
+        tag = body[16+NONCE_LEN:16+NONCE_LEN+TAG_LEN]
+        wrapped = body[16+NONCE_LEN+TAG_LEN:]
+        kdf = Scrypt(salt=salt, length=AES_KEY_LEN, n=2**14, r=8, p=1)
+        key = kdf.derive(password.encode('utf-8'))
+        cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        return decryptor.update(wrapped) + decryptor.finalize()
+    if data.startswith(MLKEM_PRIV_MAGIC):
+        return data[len(MLKEM_PRIV_MAGIC):]
+    raise RuntimeError("Not an ML-KEM-768 private key file")
+
 # ── UI ──────────────────────────────────────────
 
 def show_menu():
@@ -214,7 +294,7 @@ def show_menu():
     print(f"   {c('Brain folder:', CYAN)} {shorten_path(bf)}")
     print(f"   {c('Keys folder:', CYAN)} {shorten_path(os.path.dirname(kf) if kf and kf != '(not set)' else '(not set)')}")
     print(f"   {c('XOR key:', CYAN)}      {shorten_path(get_xor_key_path())} {c('[OK]', GREEN) if xor_ok else c('[MISSING]', RED)}")
-    print(f"   {c('Encryption:', CYAN)}    RSA-4096 + AES-256-GCM")
+    print(f"   {c('Encryption:', CYAN)}    {PQC_LABEL} {PQC_BADGE}")
     print(f"{BOLD}+{'-'*48}+{RESET}\n")
 
 def show_config():
@@ -230,14 +310,17 @@ def show_config():
 
     print(c("  Current Settings:\n", YELLOW))
     print(f"  {c('Brain folder:', CYAN)}     {config.get('brain_folder') or '(not set)'}")
+    mlk_priv, mlk_pub = get_mlkem_key_paths()
+    print(f"  {c('ML-KEM private:', CYAN)}   {mlk_priv}")
+    print(f"  {c('ML-KEM public:', CYAN)}    {mlk_pub} {c('[OK]', GREEN) if os.path.exists(mlk_pub) else c('[MISSING]', RED)}")
     print(f"  {c('XOR key:', CYAN)}          {xor_path} ({xor_size} bytes)")
-    print(f"  {c('Encryption:', CYAN)}       RSA-4096 + AES-256-GCM")
+    print(f"  {c('Encryption:', CYAN)}       {PQC_LABEL} {PQC_BADGE}")
     print(f"\n{BOLD}+{'-'*48}+{RESET}\n")
     print(c("  What would you like to configure?\n", YELLOW))
     print(f"  {c('[1]', CYAN)} Set Brain folder path")
     print(f"  {c('[2]', CYAN)} Set Keys folder path")
     print(f"  {c('[3]', CYAN)} Set XOR key path")
-    print(f"  {c('[4]', CYAN)} Generate new RSA-4096 keys")
+    print(f"  {c('[4]', CYAN)} Generate new ML-KEM-768 keys (Post-Quantum Safe)")
     print(f"  {c('[5]', CYAN)} Generate new XOR key (for filenames)")
     print(f"  {c('[6]', CYAN)} Reset to defaults")
     print(f"  {c('[7]', CYAN)} Back to main menu\n")
@@ -249,7 +332,7 @@ def show_config():
     elif choice == '3':
         set_xor_key_path(config)
     elif choice == '4':
-        generate_rsa_keys()
+        generate_mlkem_keys()
     elif choice == '5':
         generate_xor_key()
     elif choice == '6':
@@ -303,17 +386,21 @@ def set_keys_folder(config):
         os.makedirs(folder, exist_ok=True)
         config['private_key'] = os.path.join(folder, 'private_key.pem')
         config['public_key'] = os.path.join(folder, 'public_key.pem')
+        config['mlkem_private_key'] = os.path.join(folder, 'mlkem_private_key.bin')
+        config['mlkem_public_key'] = os.path.join(folder, 'mlkem_public_key.bin')
     else:
         config['private_key'] = os.path.join(script_dir, 'private_key.pem')
         config['public_key'] = os.path.join(script_dir, 'public_key.pem')
+        config['mlkem_private_key'] = os.path.join(script_dir, 'mlkem_private_key.bin')
+        config['mlkem_public_key'] = os.path.join(script_dir, 'mlkem_public_key.bin')
     save_config(config)
-    if os.path.exists(config['public_key']):
-        print(c("\n  RSA-4096 keys found in this folder!", GREEN))
+    if os.path.exists(config['mlkem_public_key']):
+        print(c("\n  ML-KEM-768 keys found in this folder!", GREEN))
     else:
-        print(c("\n  No RSA-4096 keys found in this folder yet.", YELLOW))
-        gen = input("  Generate new RSA-4096 keys now? (Y/n): ").strip().lower()
+        print(c("\n  No ML-KEM-768 keys found in this folder yet.", YELLOW))
+        gen = input("  Generate new ML-KEM-768 keys now? (Y/n): ").strip().lower()
         if gen != 'n':
-            generate_rsa_keys()
+            generate_mlkem_keys()
             return
     input("\n  Press Enter to return to config...")
 
@@ -365,15 +452,15 @@ def generate_xor_key():
     print(f"  Path: {xor_path} ({len(key)} bytes)\n")
     input("  Press Enter to return...")
 
-def generate_rsa_keys():
+def generate_mlkem_keys():
     config = load_config()
-    priv, pub = get_key_paths()
+    priv, pub = get_mlkem_key_paths()
     if os.path.exists(priv):
         clear()
         print(f"\n{BOLD}+{'='*48}+{RESET}")
-        print(c("         RSA-4096 KEY GENERATION", BOLD + MAGENTA))
+        print(c("       ML-KEM-768 KEY GENERATION", BOLD + MAGENTA))
         print(f"{BOLD}+{'='*48}+{RESET}\n")
-        print(c("  RSA-4096 keys already exist!\n", YELLOW))
+        print(c("  ML-KEM-768 keys already exist!\n", YELLOW))
         print(f"  Private: {priv}")
         print(f"  Public:  {pub}\n")
         if input("  Overwrite? (y/N): ").strip().lower() != 'y':
@@ -382,29 +469,21 @@ def generate_rsa_keys():
             return
     clear()
     print(f"\n{BOLD}+{'='*48}+{RESET}")
-    print(c("         RSA-4096 KEY GENERATION", BOLD + MAGENTA))
+    print(c("       ML-KEM-768 KEY GENERATION", BOLD + MAGENTA))
     print(f"{BOLD}+{'='*48}+{RESET}\n")
-    print(c("  Generating RSA-4096 keypair...\n", YELLOW))
-    key = serialization.generate_private_key(
-        public_exponent=65537, key_size=4096, backend=default_backend()
-    )
+    print(c("  ML-KEM-768 - NIST Post-Quantum standard (FIPS 203)", CYAN))
+    print(c("  POST-QUANTUM SAFE", BOLD + GREEN))
+    print(c("  Generating ML-KEM-768 keypair...\n", YELLOW))
+    ek, dk = ML_KEM_768.keygen()
     password = getpass.getpass("  Enter password to protect private key\n  (press Enter for none): ")
-    os.makedirs(os.path.dirname(priv), exist_ok=True)
-    enc = serialization.BestAvailableEncryption(password.encode('utf-8')) if password else serialization.NoEncryption()
-    with open(priv, 'wb') as f:
-        f.write(key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=enc,
-        ))
+    save_mlkem_private_key(dk, priv, password)
+    os.makedirs(os.path.dirname(pub), exist_ok=True)
     with open(pub, 'wb') as f:
-        f.write(key.public_key().public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        ))
+        f.write(ek)
     print(c("\n  Keys generated successfully!", GREEN))
     print(f"\n  {c(os.path.basename(priv), BOLD)}  <- {c('KEEP THIS SECRET!', RED)}")
     print(f"  {c(os.path.basename(pub), BOLD)}   <- {c('Safe to share', CYAN)}")
+    print(c("\n  ML-KEM-768 is resistant to quantum computer attacks.", CYAN))
     input("\n  Press Enter to continue...")
 
 def reset_config():
@@ -427,7 +506,7 @@ def encrypt_vault():
     run_encrypt(interactive=True)
 
 def run_encrypt(interactive=True):
-    print(f"  {c('Encryption method:', CYAN)} RSA-4096 + AES-256-GCM\n")
+    print(f"  {c('Encryption method:', CYAN)} {PQC_LABEL} {PQC_BADGE}\n")
 
     brain_folder = get_brain_folder()
 
@@ -445,17 +524,24 @@ def run_encrypt(interactive=True):
         return False
 
     manifest_path = os.path.join(brain_folder, MANIFEST_FILE)
-
-    print(c("  Loading RSA-4096 public key...", YELLOW))
-    _, pub_key_file = get_key_paths()
-    if not os.path.exists(pub_key_file):
-        print(c("  Public key not found!", RED))
-        print(f"  Expected: {pub_key_file}\n" + c("  Go to Config > Generate new RSA-4096 keys.\n", YELLOW))
+    existing_mode = get_manifest_mode(manifest_path)
+    if existing_mode and existing_mode != 'ml-kem-768':
+        print(c("\n  This vault was encrypted with RSA-4096 (legacy).", RED))
+        print(c("  Decrypt it first to convert it to ML-KEM-768.\n", YELLOW))
         if interactive:
             input("  Press Enter to return to menu...")
         return False
-    with open(pub_key_file, 'rb') as f:
-        public_key = serialization.load_pem_public_key(f.read(), backend=default_backend())
+
+    print(c("  Loading ML-KEM-768 public key...", YELLOW))
+    mlk_priv_file, mlk_pub_file = get_mlkem_key_paths()
+    if not os.path.exists(mlk_pub_file):
+        print(c("  ML-KEM-768 public key not found!", RED))
+        print(f"  Expected: {mlk_pub_file}\n" + c("  Go to Config > Generate new ML-KEM-768 keys.\n", YELLOW))
+        if interactive:
+            input("  Press Enter to return to menu...")
+        return False
+    with open(mlk_pub_file, 'rb') as f:
+        public_key = f.read()
     print(c("  Public key loaded\n", GREEN))
 
     rel_paths = get_rel_paths(brain_folder)
@@ -489,12 +575,12 @@ def run_encrypt(interactive=True):
 
             with open(full, 'rb') as f:
                 content = f.read()
-            enc_data = hybrid_encrypt(content, public_key)
+            enc_data = mlkem_hybrid_encrypt(content, public_key)
 
             parent_dir = os.path.dirname(full)
             new_full = os.path.join(parent_dir, safe_filename)
             with open(new_full, 'wb') as f:
-                f.write(MAGIC_HEADER + base64.b64encode(enc_data))
+                f.write(MLKEM_MAGIC + base64.b64encode(enc_data))
 
             os.remove(full)
 
@@ -506,9 +592,9 @@ def run_encrypt(interactive=True):
 
     manifest = {'files': manifest_files}
     manifest_bytes = json.dumps(manifest, indent=2).encode('utf-8')
-    enc_manifest = hybrid_encrypt(manifest_bytes, public_key)
+    enc_manifest = mlkem_hybrid_encrypt(manifest_bytes, public_key)
     with open(manifest_path, 'wb') as f:
-        f.write(MAGIC_HEADER + base64.b64encode(enc_manifest))
+        f.write(MLKEM_MAGIC + base64.b64encode(enc_manifest))
 
     print()
     print(c("  +---------------------------------------------+", CYAN))
@@ -548,26 +634,44 @@ def decrypt_vault():
         print(c("  Manifest uses an unknown or corrupted format.", RED))
         input("  Press Enter to return to menu...")
         return
-    print(f"  {c('Manifest encryption:', CYAN)} RSA-4096\n")
+    mode_text = 'ML-KEM-768 ' + PQC_BADGE if mode == 'ml-kem-768' else 'RSA-4096 (legacy)'
+    print(f"  {c('Manifest encryption:', CYAN)} {mode_text}\n")
 
-    priv_key_file, pub_key_file = get_key_paths()
-    if not os.path.exists(priv_key_file):
-        print(c("  Private key not found!", RED))
-        print(f"  Expected: {priv_key_file}\n" + c("  Go to Config > Set Keys folder.\n", YELLOW))
-        input("  Press Enter to return to menu...")
-        return
-    password = getpass.getpass("  Enter private key password\n  (press Enter if none): ") or ""
-    try:
-        with open(priv_key_file, 'rb') as f:
-            private_key = serialization.load_pem_private_key(
-                f.read(), password=password.encode() if password else None, backend=default_backend()
-            )
-    except Exception:
-        print(c("\n  Wrong password or corrupted key file", RED))
-        input("  Press Enter to return to menu...")
-        return
-    decrypt_blob = hybrid_decrypt
-    file_header = MAGIC_HEADER
+    if mode == 'ml-kem-768':
+        priv_key_file, _ = get_mlkem_key_paths()
+        if not os.path.exists(priv_key_file):
+            print(c("  ML-KEM-768 private key not found!", RED))
+            print(f"  Expected: {priv_key_file}\n")
+            input("  Press Enter to return to menu...")
+            return
+        password = getpass.getpass("  Enter ML-KEM-768 private key password\n  (press Enter if none): ") or ""
+        try:
+            private_key = read_mlkem_private_key(priv_key_file, password)
+        except Exception:
+            print(c("\n  Wrong password or corrupted key file", RED))
+            input("  Press Enter to return to menu...")
+            return
+        decrypt_blob = mlkem_hybrid_decrypt
+        file_header = MLKEM_MAGIC
+    else:
+        priv_key_file, pub_key_file = get_key_paths()
+        if not os.path.exists(priv_key_file):
+            print(c("  Private key not found!", RED))
+            print(f"  Expected: {priv_key_file}\n" + c("  Go to Config > Set Keys folder.\n", YELLOW))
+            input("  Press Enter to return to menu...")
+            return
+        password = getpass.getpass("  Enter private key password\n  (press Enter if none): ") or ""
+        try:
+            with open(priv_key_file, 'rb') as f:
+                private_key = serialization.load_pem_private_key(
+                    f.read(), password=password.encode() if password else None, backend=default_backend()
+                )
+        except Exception:
+            print(c("\n  Wrong password or corrupted key file", RED))
+            input("  Press Enter to return to menu...")
+            return
+        decrypt_blob = hybrid_decrypt
+        file_header = MAGIC_HEADER
     print(c("  Private key loaded\n", GREEN))
 
     with open(manifest_path, 'rb') as f:
