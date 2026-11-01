@@ -4,6 +4,8 @@ import base64
 import json
 import getpass
 import secrets
+import threading
+import time
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
@@ -295,6 +297,13 @@ def show_menu():
     print(f"   {c('Keys folder:', CYAN)} {shorten_path(os.path.dirname(kf) if kf and kf != '(not set)' else '(not set)')}")
     print(f"   {c('XOR key:', CYAN)}      {shorten_path(get_xor_key_path())} {c('[OK]', GREEN) if xor_ok else c('[MISSING]', RED)}")
     print(f"   {c('Encryption:', CYAN)}    {PQC_LABEL} {PQC_BADGE}")
+    idle_txt = 'n/a'
+    if _watch_state['checked']:
+        if _watch_state['last_change']:
+            idle_txt = f"{int((time.time() - _watch_state['last_change']) / 60)}m"
+        else:
+            idle_txt = 'scanning'
+    print(f"   {c('Auto-encrypt:', CYAN)}  after {AUTO_ENCRYPT_IDLE_MINUTES}m idle w/ key drive (idle: {idle_txt})")
     print(f"{BOLD}+{'-'*48}+{RESET}\n")
 
 def show_config():
@@ -496,6 +505,79 @@ def reset_config():
         print(c("\n  Config reset to defaults.", GREEN))
         input("  Press Enter to continue...")
 
+# ── WATCHDOG (AUTO-ENCRYPT AFTER IDLE) ──────────
+
+AUTO_ENCRYPT_IDLE_MINUTES = 30
+AUTO_ENCRYPT_POLL_SECONDS = 15
+_enc_lock = threading.Lock()
+_watch_state = {'last_change': 0.0, 'checked': False}
+
+def key_drive_available():
+    mlk_priv, mlk_pub = get_mlkem_key_paths()
+    drive = os.path.splitdrive(mlk_pub)[0]
+    if not drive or not os.path.exists(drive + os.sep):
+        return False
+    if not os.path.exists(mlk_pub):
+        return False
+    if not os.path.exists(get_xor_key_path()):
+        return False
+    return True
+
+def vault_last_change():
+    brain_folder = get_brain_folder()
+    if not os.path.isdir(brain_folder):
+        return None
+    latest = 0.0
+    for root, dirs, files in os.walk(brain_folder):
+        dirs[:] = [d for d in dirs if d != '.obsidian']
+        for f in files:
+            if f == MANIFEST_FILE:
+                continue
+            try:
+                mt = os.path.getmtime(os.path.join(root, f))
+            except OSError:
+                continue
+            if mt > latest:
+                latest = mt
+    return latest or None
+
+def auto_encrypt_eligible(mt=None):
+    if not key_drive_available():
+        return False, 'key drive not available'
+    brain_folder = get_brain_folder()
+    if os.path.exists(os.path.join(brain_folder, MANIFEST_FILE)):
+        return False, 'already encrypted'
+    if mt is None:
+        mt = vault_last_change()
+    if mt is None:
+        return False, 'no files to encrypt'
+    idle = time.time() - mt
+    if idle < AUTO_ENCRYPT_IDLE_MINUTES * 60:
+        return False, f'idle {int(idle/60)}m of {AUTO_ENCRYPT_IDLE_MINUTES}m'
+    return True, f'ready (idle {int(idle/60)}m)'
+
+def watchdog_loop():
+    while True:
+        try:
+            mt = vault_last_change()
+            _watch_state['last_change'] = mt or 0.0
+            _watch_state['checked'] = True
+            if mt is None:
+                time.sleep(AUTO_ENCRYPT_POLL_SECONDS)
+                continue
+            ok, reason = auto_encrypt_eligible(mt)
+            if ok:
+                print(c(f"\n  [WATCHDOG] Key drive plugged in, vault idle >= {AUTO_ENCRYPT_IDLE_MINUTES} min - encrypting...", CYAN))
+                if _enc_lock.acquire(blocking=False):
+                    try:
+                        run_encrypt(interactive=False)
+                    finally:
+                        _enc_lock.release()
+                    time.sleep(60)
+        except Exception as e:
+            print(c(f"\n  [WATCHDOG] error: {e}", RED))
+        time.sleep(AUTO_ENCRYPT_POLL_SECONDS)
+
 # ── ENCRYPT ─────────────────────────────────────
 
 def encrypt_vault():
@@ -604,7 +686,7 @@ def run_encrypt(interactive=True):
     if interactive:
         input("  Press Enter to return to menu...")
     else:
-        print(c("  Vault encrypted.", GREEN))
+        print(c("  [AUTO] Vault encrypted by watchdog.", GREEN))
     return True
 
 # ── DECRYPT ─────────────────────────────────────
@@ -748,6 +830,8 @@ def main():
         script_dir = os.path.dirname(sys.executable)
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    threading.Thread(target=watchdog_loop, daemon=True, name='watchdog').start()
 
     while True:
         show_menu()
