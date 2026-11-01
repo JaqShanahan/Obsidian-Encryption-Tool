@@ -635,6 +635,7 @@ def run_encrypt(interactive=True):
         return False
 
     manifest_files = {}
+    manifest_dirs = {}
     print(c("  +---------------------------------------------+", CYAN))
     print(c("    ENCRYPTING", BOLD))
     print(c("  +---------------------------------------------+", CYAN))
@@ -650,10 +651,8 @@ def run_encrypt(interactive=True):
             pass
 
         try:
-            parent_rel = os.path.dirname(rel).replace(os.sep, '/')
-            enc_name = xor_encrypt_name(os.path.basename(rel))
-            safe_name = f"{parent_rel}/{enc_name}" if parent_rel else enc_name
-            safe_filename = enc_name
+            safe_name = xor_encrypt_name(rel)
+            safe_filename = safe_name.split('/')[-1]
 
             with open(full, 'rb') as f:
                 content = f.read()
@@ -672,7 +671,40 @@ def run_encrypt(interactive=True):
             print(c(f"\n  Error encrypting {rel}: {e}", RED))
         progress_bar(i, len(rel_paths))
 
-    manifest = {'files': manifest_files}
+    all_dirs = set()
+    for rel in rel_paths:
+        d = os.path.dirname(rel)
+        while d:
+            all_dirs.add(d)
+            d = os.path.dirname(d)
+
+    if not os.path.exists(manifest_path):
+        for root, subdirs, files in os.walk(brain_folder):
+            subdirs[:] = [d for d in subdirs if d != '.obsidian']
+            for sub in subdirs:
+                all_dirs.add(os.path.relpath(os.path.join(root, sub), brain_folder))
+
+    for old_dir_rel in sorted(all_dirs, key=lambda x: len(x.split(os.sep)), reverse=True):
+        try:
+            safe_dir = xor_encrypt_name(old_dir_rel)
+            safe_parts = safe_dir.split('/')
+            new_dirname = safe_parts[-1]
+            old_dir_full = os.path.join(brain_folder, old_dir_rel)
+            new_dir_full = os.path.join(os.path.dirname(old_dir_full), new_dirname)
+            manifest_dirs[safe_dir] = old_dir_rel
+            if os.path.isdir(old_dir_full) and old_dir_full != new_dir_full:
+                if os.path.exists(new_dir_full):
+                    for _ in range(8):
+                        try:
+                            os.rmdir(new_dir_full)
+                            break
+                        except OSError:
+                            time.sleep(0.5)
+                os.rename(old_dir_full, new_dir_full)
+        except Exception:
+            pass
+
+    manifest = {'files': manifest_files, 'dirs': manifest_dirs}
     manifest_bytes = json.dumps(manifest, indent=2).encode('utf-8')
     enc_manifest = mlkem_hybrid_encrypt(manifest_bytes, public_key)
     with open(manifest_path, 'wb') as f:
@@ -680,7 +712,7 @@ def run_encrypt(interactive=True):
 
     print()
     print(c("  +---------------------------------------------+", CYAN))
-    print(f"  {c('[OK]', GREEN)} {c('Encrypted:', BOLD)} {encrypted_count}  {c('Files with XOR-encrypted names', BOLD)}")
+    print(f"  {c('[OK]', GREEN)} {c('Encrypted:', BOLD)} {encrypted_count}  {c('Files and folders with XOR-encrypted names', BOLD)}")
     print(c("  +---------------------------------------------+", CYAN))
     print()
     if interactive:
@@ -763,8 +795,10 @@ def decrypt_vault():
 
     if isinstance(manifest, dict) and isinstance(manifest.get('files'), dict):
         file_map = manifest['files']
+        dir_entries = manifest.get('dirs', {})
     else:
         file_map = manifest
+        dir_entries = {}
 
     if not file_map:
         print(c("  Manifest is empty.\n", YELLOW))
@@ -808,12 +842,81 @@ def decrypt_vault():
 
         progress_bar(i, len(items))
 
+    dir_map = {}
+    for safe_name, orig_rel in file_map.items():
+        safe_parts = safe_name.split('/')
+        orig_parts = orig_rel.split(os.sep)
+        for i in range(len(safe_parts) - 1):
+            enc_p = os.path.normpath(os.path.join(brain_folder, *safe_parts[:i+1]))
+            orig_p = os.path.normpath(os.path.join(brain_folder, *orig_parts[:i+1]))
+            if enc_p != orig_p:
+                dir_map[enc_p] = orig_p
+
+    for enc_dir_rel, orig_dir_rel in dir_entries.items():
+        enc_p = os.path.normpath(os.path.join(brain_folder, *enc_dir_rel.split('/')))
+        orig_p = os.path.normpath(os.path.join(brain_folder, *orig_dir_rel.split(os.sep)))
+        if enc_p != orig_p:
+            dir_map[enc_p] = orig_p
+
+    # restore folder names, shallowest first, renaming each folder's leaf in place
+    # (parents first so children's target paths resolve after the parent name is restored)
+    leaf_renames = {}
+    for enc_p, orig_p in dir_map.items():
+        leaf_renames[orig_p] = os.path.basename(enc_p)
+
+    def dir_depth(p):
+        rel = os.path.relpath(p, brain_folder)
+        return 0 if rel == '.' else len(rel.split(os.sep))
+
+    for orig_p, enc_leaf in sorted(leaf_renames.items(), key=lambda kv: dir_depth(kv[0])):
+        src = os.path.normpath(os.path.join(os.path.dirname(orig_p), enc_leaf))
+        if not os.path.isdir(src):
+            continue
+        try:
+            os.makedirs(os.path.dirname(orig_p), exist_ok=True)
+        except OSError:
+            pass
+        for _ in range(8):
+            try:
+                os.rename(src, orig_p)
+                break
+            except OSError:
+                time.sleep(0.5)
+
+    restored_dirs = {os.path.normpath(p) for p in leaf_renames}
+    restored_dirs.update(os.path.normpath(os.path.dirname(f)) for f, _ in pending)
+
     for orig_full, dec_content in pending:
         os.makedirs(os.path.dirname(orig_full), exist_ok=True)
         with open(orig_full, 'wb') as f:
             f.write(dec_content)
 
     os.remove(manifest_path)
+
+    for root, dirs, files in os.walk(brain_folder, topdown=True):
+        dirs[:] = [d for d in dirs if d != '.obsidian']
+        if root == brain_folder or os.path.normpath(root) in restored_dirs:
+            continue
+        for _ in range(8):
+            try:
+                os.rmdir(root)
+                break
+            except OSError:
+                time.sleep(0.5)
+
+    workspace_path = os.path.join(brain_folder, '.obsidian', 'workspace.json')
+    if os.path.exists(workspace_path):
+        try:
+            with open(workspace_path, 'r', encoding='utf-8') as f:
+                ws = json.load(f)
+            last_open = ws.get('lastOpenFiles', [])
+            cleaned = [p for p in last_open if os.path.exists(os.path.join(brain_folder, p))]
+            if len(cleaned) != len(last_open):
+                ws['lastOpenFiles'] = cleaned
+                with open(workspace_path, 'w', encoding='utf-8') as f:
+                    json.dump(ws, f, indent=2)
+        except Exception:
+            pass
 
     print()
     print(c("  +---------------------------------------------+", CYAN))
