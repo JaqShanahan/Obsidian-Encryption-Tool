@@ -1,0 +1,6 @@
+# Runtime dependencies
+cryptography>=42.0
+kyber-py>=1.2.0
+
+# Only needed to build the standalone executable (see build.bat)
+# pyinstaller>=6.0
