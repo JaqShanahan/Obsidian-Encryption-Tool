@@ -1,5 +1,7 @@
 # 🔐 Obsidian Vault Crypto Tool
 
+*by Jaq Shanahan*
+
 > Lock your Obsidian vault at rest. Notes, file names, and folder structure all become unreadable blobs until you decrypt.
 
 A menu-driven command line tool that encrypts an entire Obsidian vault (your "Brain folder") so your notes are safe if the vault is synced, backed up, or stolen. Open the vault while it is locked and every note is an opaque blob, even to Obsidian itself.
@@ -98,4 +100,4 @@ This runs PyInstaller in onefile mode and produces `dist\obsidian_crypto.exe`.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT by Jaq Shanahan. See [LICENSE](LICENSE).
